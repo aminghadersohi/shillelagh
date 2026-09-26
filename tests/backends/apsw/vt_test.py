@@ -5,6 +5,7 @@ Tests for shillelagh.backends.apsw.vt.
 
 import datetime
 import json
+import logging
 from collections.abc import Iterable
 from typing import Any
 
@@ -25,6 +26,7 @@ from shillelagh.backends.apsw.vt import (
 from shillelagh.exceptions import ProgrammingError
 from shillelagh.fields import Field, Float, Integer, Order, String
 from shillelagh.filters import Equal, Operator
+from shillelagh.lib import serialize
 
 from ...fakes import FakeAdapter
 
@@ -78,6 +80,33 @@ def test_vt_module() -> None:
         create_table
         == """CREATE TABLE "table" ("age" REAL, "name" TEXT, "pets" INTEGER)"""
     )
+
+
+def test_vt_module_does_not_log_adapter_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Test that ``VTModule`` never logs adapter argument values.
+
+    Adapter arguments can hold credentials.
+    """
+
+    class SecretAdapter(FakeAdapter):
+        """
+        An adapter that receives a credential.
+        """
+
+        def __init__(self, token: str):
+            super().__init__()
+            self.token = token
+
+    caplog.set_level(logging.DEBUG)
+    vt_module = VTModule(SecretAdapter)
+    vt_module.Create(None, "", "", "table", f"'{serialize('s3cr3t-token')}'")
+
+    assert "s3cr3t-token" not in caplog.text
+    assert serialize("s3cr3t-token") not in caplog.text
+    assert "SecretAdapter" in caplog.text
 
 
 def test_virtual_best_index() -> None:
