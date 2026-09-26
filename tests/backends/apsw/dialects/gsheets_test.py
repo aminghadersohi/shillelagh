@@ -14,6 +14,7 @@ from requests_mock.mocker import Mocker
 from sqlalchemy import MetaData, Table, inspect
 from sqlalchemy.engine import create_engine
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import ArgumentError
 
 from shillelagh.backends.apsw.dialects.gsheets import APSWGSheetsDialect, extract_query
 from shillelagh.exceptions import ProgrammingError
@@ -166,7 +167,7 @@ def test_get_table_names(mocker: MockerFixture, requests_mock: Mocker) -> None:
         "GET",
         (
             "https://www.googleapis.com/drive/v3/files?"
-            "q=mimeType='application/vnd.google-apps.spreadsheet'"
+            "q=mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
         ),
         json={"files": [{"id": 1}, {"id": 2}, {"id": 3}]},
     )
@@ -275,7 +276,7 @@ def test_drive_api_disabled(mocker: MockerFixture, requests_mock: Mocker) -> Non
         "GET",
         (
             "https://www.googleapis.com/drive/v3/files?"
-            "q=mimeType='application/vnd.google-apps.spreadsheet'"
+            "q=mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
         ),
         json={
             "error": {
@@ -495,3 +496,80 @@ def test_import_dbapi() -> None:
     Test ``import_dbapi``.
     """
     assert APSWGSheetsDialect.import_dbapi() == APSWGSheetsDialect.dbapi()
+
+
+def test_engine_adapter_kwargs() -> None:
+    """
+    Test that ``adapter_kwargs`` passed to ``create_engine`` are used.
+    """
+    info = {"secret": "XXX"}
+    engine = create_engine(
+        "gsheets://",
+        adapter_kwargs={"gsheetsapi": {"service_account_info": info}},
+    )
+    _, kwargs = engine.dialect.create_connect_args(engine.url)
+    assert kwargs["adapter_kwargs"]["gsheetsapi"]["service_account_info"] == info
+
+    with pytest.raises(ArgumentError) as excinfo:
+        create_engine("gsheets://", adapter_kwargs={"csvfile": {}})
+    assert "only the gsheetsapi adapter" in str(excinfo.value)
+    with pytest.raises(ArgumentError) as excinfo:
+        create_engine("gsheets://", adapter_kwargs={"gsheetsapi": {"invalid": 1}})
+    assert "Unknown gsheetsapi adapter argument 'invalid'" in str(excinfo.value)
+    with pytest.raises(ArgumentError) as excinfo:
+        create_engine(
+            "gsheets://",
+            access_token="a",
+            adapter_kwargs={"gsheetsapi": {"access_token": "b"}},
+        )
+    assert "given twice" in str(excinfo.value)
+    # the same value twice is fine
+    create_engine(
+        "gsheets://",
+        access_token="a",
+        adapter_kwargs={"gsheetsapi": {"access_token": "a"}},
+    )
+
+
+def test_get_table_names_connect_args_and_pages(
+    mocker: MockerFixture,
+    requests_mock: Mocker,
+) -> None:
+    """
+    Test ``get_table_names`` with credentials in ``connect_args`` and many pages.
+    """
+    session = requests.Session()
+    session.mount("https://", requests_mock)
+    mocker.patch(
+        "shillelagh.backends.apsw.dialects.gsheets.AuthorizedSession",
+        return_value=session,
+    )
+    get_credentials = mocker.patch(
+        "shillelagh.backends.apsw.dialects.gsheets.get_credentials",
+        return_value="SECRET",
+    )
+    mocker.patch(
+        "shillelagh.backends.apsw.dialects.gsheets.get_sheet_urls",
+        side_effect=lambda spreadsheet_id, session: [f"url-{spreadsheet_id}"],
+    )
+    requests_mock.register_uri(
+        "GET",
+        "https://www.googleapis.com/drive/v3/files",
+        [
+            {"json": {"files": [{"id": "a"}], "nextPageToken": "next"}},
+            {"json": {"files": [{"id": "b"}]}},
+        ],
+    )
+
+    # Superset passes the credentials via ``connect_args``, so they are only in
+    # the connection's adapter arguments, not in the dialect
+    connection = mock.MagicMock(spec=["_adapter_kwargs"])
+    connection._adapter_kwargs = {  # pylint: disable=protected-access
+        "gsheetsapi": {"service_account_info": {"secret": "XXX"}},
+    }
+    dialect = APSWGSheetsDialect(list_all_sheets=True)
+    assert dialect.get_table_names(connection) == ["url-a", "url-b"]
+    assert get_credentials.call_args.args[2] == {"secret": "XXX"}
+    first, second = requests_mock.request_history
+    assert "trashed=false" in first.qs["q"][0]
+    assert second.qs["pagetoken"] == ["next"]

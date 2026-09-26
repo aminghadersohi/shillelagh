@@ -18,7 +18,11 @@ import requests_mock
 from pytest_mock import MockerFixture
 from sqlalchemy import create_engine, text
 
-from shillelagh.adapters.api.gsheets.adapter import GSheetsAPI
+from shillelagh.adapters.api.gsheets.adapter import (
+    ANONYMOUS_TIMEOUT_SECONDS,
+    GSheetsAPI,
+    TimeoutSession,
+)
 from shillelagh.backends.apsw.db import connect
 from shillelagh.exceptions import (
     InterfaceError,
@@ -156,6 +160,12 @@ def simple_sheet_adapter() -> Iterator[requests_mock.Adapter]:
                 ["CR", "10"],
             ],
         },
+    )
+    # stored (user-entered) cells, downloaded in ``BATCH`` mode; empty here
+    adapter.register_uri(
+        "GET",
+        "https://sheets.googleapis.com/v4/spreadsheets/1?includeGridData=true",
+        json={"sheets": [{"data": [{}]}]},
     )
     yield adapter
 
@@ -656,7 +666,7 @@ def test_get_session(mocker: MockerFixture) -> None:
         mock_authorized_session,
     )
     mock_session = mock.MagicMock()
-    mocker.patch("shillelagh.adapters.api.gsheets.adapter.Session", mock_session)
+    mocker.patch("shillelagh.adapters.api.gsheets.adapter.TimeoutSession", mock_session)
     mocker.patch(
         "shillelagh.adapters.api.gsheets.adapter.get_credentials",
         return_value=None,
@@ -1439,22 +1449,9 @@ def test_update_data(
         return_value=session,
     )
     simple_sheet_adapter.register_uri(
-        "PUT",
-        (
-            "https://sheets.googleapis.com/v4/spreadsheets/1"
-            "/values/Sheet1!A6?valueInputOption=USER_ENTERED"
-        ),
-        json={
-            "spreadsheetId": "1",
-            "tableRange": "'Sheet1'!A6:B6",
-            "updates": {
-                "spreadsheetId": "1",
-                "updatedRange": "'Sheet1!A6:B6",
-                "updatedRows": 1,
-                "updatedColumns": 1,
-                "updatedCells": 1,
-            },
-        },
+        "POST",
+        "https://sheets.googleapis.com/v4/spreadsheets/1/values:batchUpdate",
+        json={"spreadsheetId": "1", "totalUpdatedCells": 1},
     )
 
     gsheets_adapter = GSheetsAPI("https://docs.google.com/spreadsheets/d/1/edit", "XXX")
@@ -1470,10 +1467,12 @@ def test_update_data(
         3: {"cnt": "11", "country": "PY"},
         4: {"cnt": "12", "country": "PL"},
     }
+    # only the changed cell is written
     assert simple_sheet_adapter.last_request.json() == {
-        "majorDimension": "ROWS",
-        "range": "Sheet1!A6",
-        "values": [["CR", "12"]],
+        "valueInputOption": "USER_ENTERED",
+        "data": [
+            {"range": "'Sheet1'!B6", "majorDimension": "ROWS", "values": [["12"]]},
+        ],
     }
 
     simple_sheet_adapter.register_uri(
@@ -1502,6 +1501,9 @@ def test_update_data(
         3: {"cnt": "11", "country": "PY"},
         4: {"cnt": "12", "country": "PL"},
     }
+    assert simple_sheet_adapter.last_request.json()["data"] == [
+        {"range": "'Sheet1'!A6", "majorDimension": "ROWS", "values": [["UK"]]},
+    ]
 
     with pytest.raises(ProgrammingError) as excinfo:
         gsheets_adapter.update_row(4, {"cnt": "13", "country": "PL"})
@@ -1512,11 +1514,8 @@ def test_update_data(
     assert str(excinfo.value) == "Invalid row to update: 5"
 
     simple_sheet_adapter.register_uri(
-        "PUT",
-        (
-            "https://sheets.googleapis.com/v4/spreadsheets/1"
-            "/values/Sheet1!A7?valueInputOption=USER_ENTERED"
-        ),
+        "POST",
+        "https://sheets.googleapis.com/v4/spreadsheets/1/values:batchUpdate",
         json={
             "error": {
                 "code": 404,
@@ -1707,7 +1706,7 @@ def test_batch_sync_mode(
         ["UK", "10"],
     ]
 
-    _logger.info.assert_called_with(
+    _logger.info.assert_any_call(
         "GET %s?%s",
         "https://sheets.googleapis.com/v4/spreadsheets/1/values/Sheet1",
         "valueRenderOption=FORMATTED_VALUE",
@@ -2020,22 +2019,9 @@ def test_unidirectional_sync_mode(
         },
     )
     update = simple_sheet_adapter.register_uri(
-        "PUT",
-        (
-            "https://sheets.googleapis.com/v4/spreadsheets/1"
-            "/values/Sheet1!A6?valueInputOption=USER_ENTERED"
-        ),
-        json={
-            "spreadsheetId": "1",
-            "tableRange": "'Sheet1'!A1:F10",
-            "updates": {
-                "spreadsheetId": "1",
-                "updatedRange": "'Sheet1!A11",
-                "updatedRows": 1,
-                "updatedColumns": 1,
-                "updatedCells": 1,
-            },
-        },
+        "POST",
+        "https://sheets.googleapis.com/v4/spreadsheets/1/values:batchUpdate",
+        json={"spreadsheetId": "1", "totalUpdatedCells": 1},
     )
     get_values = simple_sheet_adapter.register_uri(
         "GET",
@@ -2453,3 +2439,241 @@ def test_session_verify(
     connection.execute(text(sql))
 
     assert session.verify is False
+
+
+def test_update_data_keeps_unchanged_cells(
+    mocker: MockerFixture,
+    simple_sheet_adapter: requests_mock.Adapter,
+) -> None:
+    """
+    Test that ``update_data`` writes only changed cells, with unlabeled columns.
+    """
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.get_credentials",
+        return_value="SECRET",
+    )
+    session = requests.Session()
+    session.mount("https://", simple_sheet_adapter)
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.GSheetsAPI._get_session",
+        return_value=session,
+    )
+    update = simple_sheet_adapter.register_uri(
+        "POST",
+        "https://sheets.googleapis.com/v4/spreadsheets/1/values:batchUpdate",
+        json={"spreadsheetId": "1"},
+    )
+    gsheets_adapter = GSheetsAPI("https://docs.google.com/spreadsheets/d/1/edit", "XXX")
+    # column B has no label, column C holds a formula
+    gsheets_adapter._column_map = {"country": "A", "cnt": "C", "code": "D"}
+    mocker.patch.object(
+        gsheets_adapter,
+        "_get_values",
+        return_value=[
+            ["country", "", "cnt", "code"],
+            ["BR", "note", "2", "001"],
+        ],
+    )
+    gsheets_adapter._row_ids = {0: {"country": "BR", "cnt": "2", "code": "001"}}
+
+    gsheets_adapter.update_data(
+        0,
+        {"country": "UK", "cnt": "2", "code": "001", "rowid": 0},
+    )
+    assert update.last_request.json() == {
+        "valueInputOption": "USER_ENTERED",
+        "data": [
+            {"range": "'Sheet1'!A2", "majorDimension": "ROWS", "values": [["UK"]]},
+        ],
+    }
+
+    # no changes, no request
+    gsheets_adapter._get_values.return_value = [  # type: ignore[attr-defined]
+        ["country", "", "cnt", "code"],
+        ["UK", "note", "2", "001"],
+    ]
+    gsheets_adapter.update_data(
+        0,
+        {"country": "UK", "cnt": "2", "code": "001", "rowid": 0},
+    )
+    assert update.call_count == 1
+
+
+def test_batch_sync_mode_keeps_stored_cells(
+    mocker: MockerFixture,
+    simple_sheet_adapter: requests_mock.Adapter,
+) -> None:
+    """
+    Test that ``BATCH`` uploads untouched cells from their stored values.
+    """
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.get_credentials",
+        return_value="SECRET",
+    )
+    session = requests.Session()
+    session.mount("https://", simple_sheet_adapter)
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.GSheetsAPI._get_session",
+        return_value=session,
+    )
+    simple_sheet_adapter.register_uri(
+        "GET",
+        (
+            "https://sheets.googleapis.com/v4/spreadsheets/1"
+            "/values/Sheet1?valueRenderOption=FORMATTED_VALUE"
+        ),
+        json={"values": [["country", "cnt"], ["001", "4"], ["BR", "1"]]},
+    )
+
+    def cell(**value: Any) -> dict[str, Any]:
+        return {"userEnteredValue": value}
+
+    simple_sheet_adapter.register_uri(
+        "GET",
+        "https://sheets.googleapis.com/v4/spreadsheets/1?includeGridData=true",
+        json={
+            "sheets": [
+                {
+                    "data": [
+                        {
+                            "rowData": [
+                                {
+                                    "values": [
+                                        cell(stringValue="country"),
+                                        cell(stringValue="cnt"),
+                                    ],
+                                },
+                                {
+                                    "values": [
+                                        cell(stringValue="001"),
+                                        cell(formulaValue="=2*2"),
+                                    ],
+                                },
+                                {
+                                    "values": [
+                                        cell(boolValue=True),
+                                        cell(numberValue=1),
+                                        cell(errorValue={"type": "ERROR"}),
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    upload = simple_sheet_adapter.register_uri(
+        "PUT",
+        (
+            "https://sheets.googleapis.com/v4/spreadsheets/1"
+            "/values/Sheet1?valueInputOption=USER_ENTERED"
+        ),
+        json={},
+    )
+    gsheets_adapter = GSheetsAPI(
+        "https://docs.google.com/spreadsheets/d/1/edit?sync_mode=BATCH",
+        "XXX",
+    )
+    gsheets_adapter._column_map = {"country": "A", "cnt": "B"}
+    gsheets_adapter._row_ids = {1: {"country": "BR", "cnt": "1"}}
+    gsheets_adapter.update_data(1, {"country": "BR", "cnt": "5", "rowid": 1})
+    gsheets_adapter.insert_data({"country": "UK", "cnt": "8", "rowid": None})
+    gsheets_adapter.close()
+
+    assert upload.last_request.json()["values"] == [
+        ["'country", "'cnt", ""],
+        ["'001", "=2*2", ""],
+        [True, "5", ""],
+        ["UK", "8", ""],
+    ]
+
+
+def test_anonymous_session_timeout(mocker: MockerFixture) -> None:
+    """
+    Test that anonymous requests have a default timeout.
+    """
+    request = mocker.patch("requests.Session.request")
+    TimeoutSession().get("https://example.com/")
+    assert request.call_args.kwargs["timeout"] == ANONYMOUS_TIMEOUT_SECONDS
+    TimeoutSession().get("https://example.com/", timeout=5)
+    assert request.call_args.kwargs["timeout"] == 5
+
+
+def test_unidirectional_update_local_copy(
+    mocker: MockerFixture,
+    simple_sheet_adapter: requests_mock.Adapter,
+) -> None:
+    """
+    Test that the local copy keeps unlabeled and extra cells on update.
+    """
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.get_credentials",
+        return_value="SECRET",
+    )
+    session = requests.Session()
+    session.mount("https://", simple_sheet_adapter)
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.GSheetsAPI._get_session",
+        return_value=session,
+    )
+    simple_sheet_adapter.register_uri(
+        "GET",
+        (
+            "https://sheets.googleapis.com/v4/spreadsheets/1"
+            "/values/Sheet1?valueRenderOption=FORMATTED_VALUE"
+        ),
+        json={"values": [["country", "", "cnt"], ["BR", "note", "1", "extra"]]},
+    )
+    simple_sheet_adapter.register_uri(
+        "POST",
+        "https://sheets.googleapis.com/v4/spreadsheets/1/values:batchUpdate",
+        json={},
+    )
+    gsheets_adapter = GSheetsAPI(
+        "https://docs.google.com/spreadsheets/d/1/edit?sync_mode=UNIDIRECTIONAL",
+        "XXX",
+    )
+    gsheets_adapter._column_map = {"country": "A", "cnt": "C"}
+    gsheets_adapter._row_ids = {0: {"country": "BR", "cnt": "1"}}
+    gsheets_adapter.update_data(0, {"country": "BR", "cnt": "2", "rowid": 0})
+    assert gsheets_adapter._get_values()[1] == ["BR", "note", "2", "extra"]
+
+
+def test_batch_sync_mode_stored_cells_error(
+    mocker: MockerFixture,
+    simple_sheet_adapter: requests_mock.Adapter,
+) -> None:
+    """
+    Test an error when downloading the stored cells in ``BATCH`` mode.
+    """
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.get_credentials",
+        return_value="SECRET",
+    )
+    session = requests.Session()
+    session.mount("https://", simple_sheet_adapter)
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.GSheetsAPI._get_session",
+        return_value=session,
+    )
+    simple_sheet_adapter.register_uri(
+        "GET",
+        (
+            "https://sheets.googleapis.com/v4/spreadsheets/1"
+            "/values/Sheet1?valueRenderOption=FORMATTED_VALUE"
+        ),
+        json={"values": [["country", "cnt"]]},
+    )
+    simple_sheet_adapter.register_uri(
+        "GET",
+        "https://sheets.googleapis.com/v4/spreadsheets/1?includeGridData=true",
+        json={"error": {"message": "Quota exceeded"}},
+    )
+    gsheets_adapter = GSheetsAPI(
+        "https://docs.google.com/spreadsheets/d/1/edit?sync_mode=BATCH",
+        "XXX",
+    )
+    with pytest.raises(ProgrammingError) as excinfo:
+        gsheets_adapter._get_values()
+    assert str(excinfo.value) == "Quota exceeded"

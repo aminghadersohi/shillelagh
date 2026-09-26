@@ -4,6 +4,7 @@ Google Sheets adapter.
 """
 
 import datetime
+import itertools
 import json
 import logging
 import urllib.parse
@@ -49,6 +50,54 @@ JSON_PAYLOAD_PREFIX = ")]}'\n"
 AVERAGE_NUMBER_OF_ROWS = 1000
 FIXED_COST = 2882
 DOWNLOAD_COST = int(AVERAGE_NUMBER_OF_ROWS * 0.4212)
+
+
+# ``google-auth``'s ``AuthorizedSession`` uses the same default.
+ANONYMOUS_TIMEOUT_SECONDS = 120
+
+
+class TimeoutSession(Session):
+    """
+    A session with a default timeout, used for anonymous access.
+
+    Without a timeout a request on a stalled network blocks forever.
+    """
+
+    def request(  # type: ignore[override]  # pylint: disable=arguments-differ
+        self,
+        method: str,
+        url: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        kwargs.setdefault("timeout", ANONYMOUS_TIMEOUT_SECONDS)
+        return super().request(method, url, *args, **kwargs)
+
+
+def quote_sheet_name(name: str) -> str:
+    """
+    Quote a sheet name for A1 notation.
+    """
+    return "'" + name.replace("'", "''") + "'"
+
+
+def get_user_entered_value(cell: Optional[dict[str, Any]]) -> Any:
+    """
+    Return a cell's stored value, encoded so that re-entering it is lossless.
+
+    Formulas are returned as-is, and text gets a leading apostrophe so that
+    ``USER_ENTERED`` input keeps it as text (eg, "001" stays a string).
+    """
+    value = (cell or {}).get("userEnteredValue") or {}
+    if "formulaValue" in value:
+        return value["formulaValue"]
+    if "stringValue" in value:
+        return "'" + value["stringValue"]
+    if "numberValue" in value:
+        return value["numberValue"]
+    if "boolValue" in value:
+        return value["boolValue"]
+    return ""
 
 
 class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
@@ -132,6 +181,8 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         self._values: Optional[list[list[Any]]] = None
         self._original_rows = 0
         self.modified = False
+        # stored (user-entered) cells of the local copy, used in ``BATCH`` mode
+        self._stored_cells: dict[int, tuple[list[Any], dict[int, Any]]] = {}
 
         # Extra metadata. Some of this metadata (sheet name and timezone)
         # can only be fetched if the user is authenticated -- that's OK,
@@ -202,7 +253,11 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
     def _get_session(self) -> Session:
         session = cast(
             Session,
-            AuthorizedSession(self.credentials) if self.credentials else Session(),
+            (
+                AuthorizedSession(self.credentials)
+                if self.credentials
+                else TimeoutSession()
+            ),
         )
 
         if self.session_verify is not None:
@@ -552,17 +607,71 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         # reduced.
         self._original_rows = len(self._values)
 
+        # In ``BATCH`` mode the whole sheet is uploaded on close. Keep the stored
+        # (user-entered) cells so that rows untouched by DML are uploaded as they
+        # were, instead of from their formatted values (which would replace
+        # formulas with their results and turn text like "001" into numbers).
+        if self._sync_mode == SyncMode.BATCH:
+            stored = self._get_stored_rows()
+            self._stored_cells = {
+                id(row): (row, dict(enumerate(cells)))
+                for row, cells in zip(self._values, stored)
+            }
+
         return self._values
+
+    def _get_stored_rows(self) -> list[list[Any]]:
+        """
+        Download the user-entered values of the sheet.
+        """
+        session = self._get_session()
+        range_ = quote_sheet_name(cast(str, self._sheet_name))
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{self._spreadsheet_id}"
+        params = {
+            "ranges": range_,
+            "includeGridData": "true",
+            "fields": "sheets(data(rowData(values(userEnteredValue))))",
+        }
+        _logger.info("GET %s?%s", url, urllib.parse.urlencode(params))
+        response = session.get(url, params=params)
+        payload = response.json()
+        _logger.debug(payload)
+        if "error" in payload:
+            raise ProgrammingError(payload["error"]["message"])
+
+        rows = payload["sheets"][0]["data"][0].get("rowData", [])
+        return [
+            [get_user_entered_value(cell) for cell in row.get("values", [])]
+            for row in rows
+        ]
+
+    def _get_stored_cells(self, row: list[Any]) -> dict[int, Any]:
+        """
+        Return the stored cells of an unmodified local row, by column index.
+        """
+        entry = self._stored_cells.get(id(row))
+        return dict(entry[1]) if entry and entry[0] is row else {}
+
+    def _get_labeled_indexes(self) -> list[int]:
+        """
+        Return the indexes of the columns that have a label.
+        """
+        return sorted(get_index_from_letters(v) for v in self._column_map.values())
 
     def _find_row_number(self, row: Row) -> int:
         """
         Return the 0-indexed number of a given row, defined by its values.
+
+        Only labeled columns are compared, since unlabeled columns are not part
+        of ``row``.
         """
         target_row_values = get_values_from_row(row, self._column_map)
+        indexes = self._get_labeled_indexes()
         for i, row_values in enumerate(self._get_values()):
             # pad with empty strings to match size
             padding = [""] * (len(target_row_values) - len(row_values))
-            if [*row_values, *padding] == target_row_values:
+            padded = [*row_values, *padding]
+            if all(padded[j] == target_row_values[j] for j in indexes):
                 return i
 
         raise ProgrammingError(f"Could not find row: {row}")
@@ -628,6 +737,9 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
     ) -> None:
         """
         Update a row in the sheet.
+
+        Only the cells whose value changed are written, so that formulas, text
+        that looks like a number and unlabeled columns in the same row are kept.
         """
         if row_id not in self._row_ids:
             raise ProgrammingError(f"Invalid row to update: {row_id}")
@@ -636,36 +748,57 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         row_number = self._find_row_number(current_row)
 
         row_values = get_values_from_row(row, self._column_map)
+        current_values = get_values_from_row(current_row, self._column_map)
+        labeled = self._get_labeled_indexes()
+        changed = [i for i in labeled if row_values[i] != current_values[i]]
 
         # In these modes we keep a local copy of the data, so we only have to
         # download the full sheet once.
         if self._sync_mode in {SyncMode.UNIDIRECTIONAL, SyncMode.BATCH}:
             values = self._get_values()
-            values[row_number] = row_values
+            old_row = values[row_number]
+            new_row = list(row_values)
+            for i, cell in enumerate(old_row):
+                if i >= len(new_row):
+                    new_row.append(cell)
+                elif i not in labeled:
+                    new_row[i] = cell
+            values[row_number] = new_row
+            if self._sync_mode == SyncMode.BATCH:
+                kept = {
+                    i: cell
+                    for i, cell in self._get_stored_cells(old_row).items()
+                    if i not in changed
+                }
+                self._stored_cells[id(new_row)] = (new_row, kept)
             self._clear_columns()
 
         # In these modes we push all changes immediately to the sheet.
-        if self._sync_mode in {SyncMode.BIDIRECTIONAL, SyncMode.UNIDIRECTIONAL}:
+        if changed and self._sync_mode in {
+            SyncMode.BIDIRECTIONAL,
+            SyncMode.UNIDIRECTIONAL,
+        }:
             session = self._get_session()
-            range_ = f"{self._sheet_name}!A{row_number + 1}"
+            sheet_name = quote_sheet_name(cast(str, self._sheet_name))
+            letters = list(itertools.islice(gen_letters(), max(changed) + 1))
             body = {
-                "range": range_,
-                "majorDimension": "ROWS",
-                "values": [row_values],
+                "valueInputOption": "USER_ENTERED",
+                "data": [
+                    {
+                        "range": f"{sheet_name}!{letters[i]}{row_number + 1}",
+                        "majorDimension": "ROWS",
+                        "values": [[row_values[i]]],
+                    }
+                    for i in changed
+                ],
             }
             url = (
                 "https://sheets.googleapis.com/v4/spreadsheets/"
-                f"{self._spreadsheet_id}/values/{range_}"
+                f"{self._spreadsheet_id}/values:batchUpdate"
             )
-            params = {"valueInputOption": "USER_ENTERED"}
-
-            # Log the URL. We can't use a prepared request here to extract the URL because
-            # it doesn't work with ``AuthorizedSession``.
-            query_string = urllib.parse.urlencode(params)
-            _logger.info("PUT %s?%s", url, query_string)
+            _logger.info("POST %s", url)
             _logger.debug(body)
-
-            response = session.put(url, json=body, params=params)
+            response = session.post(url, json=body)
             payload = response.json()
             _logger.debug(payload)
             if "error" in payload:
@@ -679,7 +812,7 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
 
         self.modified = True
 
-    def close(self) -> None:
+    def close(self) -> None:  # pylint: disable=too-many-locals
         """
         Push pending changes.
 
@@ -692,6 +825,16 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         values = self._get_values()
         if not values:
             raise InternalError("An unexpected error happened")
+
+        # Upload the stored value of every cell the DML did not change.
+        merged_values = []
+        for row in values:
+            merged = list(row)
+            for i, cell in self._get_stored_cells(row).items():
+                merged.extend([""] * (i + 1 - len(merged)))
+                merged[i] = cell
+            merged_values.append(merged)
+        values = merged_values
 
         # Pad values. This ensures that rows are padded to the right with
         # empty strings, so they override any underlying cells when the

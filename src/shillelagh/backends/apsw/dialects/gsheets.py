@@ -14,6 +14,7 @@ from typing import Any, Optional, Union, cast
 import requests
 from google.auth.transport.requests import AuthorizedSession
 from sqlalchemy.engine.url import URL
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.pool.base import _ConnectionFairy
 from typing_extensions import TypedDict
 
@@ -26,6 +27,16 @@ _logger = logging.getLogger(__name__)
 
 
 DEFAULT_TIMEOUT = timedelta(minutes=3)
+
+ADAPTER_ARGUMENTS = {
+    "access_token",
+    "service_account_file",
+    "service_account_info",
+    "subject",
+    "catalog",
+    "app_default_credentials",
+    "session_verify",
+}
 
 
 class QueryType(TypedDict, total=False):
@@ -114,6 +125,32 @@ class APSWGSheetsDialect(APSWDialect):  # pylint: disable=too-many-instance-attr
         self.list_all_sheets = list_all_sheets
         self.app_default_credentials = app_default_credentials
         self.session_verify = session_verify
+        self._fold_adapter_kwargs()
+
+    def _fold_adapter_kwargs(self) -> None:
+        """
+        Use ``adapter_kwargs={"gsheetsapi": {...}}`` passed to ``create_engine``.
+
+        This dialect builds the adapter arguments from its own attributes, so
+        without this the engine-level ``adapter_kwargs`` would be silently ignored.
+        """
+        unknown = sorted(set(self._adapter_kwargs) - {"gsheetsapi"})
+        if unknown:
+            raise ArgumentError(
+                "gsheets:// loads only the gsheetsapi adapter; got adapter_kwargs "
+                f"for {unknown}",
+            )
+        for key, value in (self._adapter_kwargs.get("gsheetsapi") or {}).items():
+            if key not in ADAPTER_ARGUMENTS:
+                raise ArgumentError(f"Unknown gsheetsapi adapter argument {key!r}")
+            current = getattr(self, key)
+            if current is None or current is False or current == {}:
+                setattr(self, key, value)
+            elif current != value:
+                raise ArgumentError(
+                    f"gsheetsapi argument {key!r} is given twice with different "
+                    "values",
+                )
 
     def create_connect_args(self, url: URL) -> tuple[tuple[()], dict[str, Any]]:
         adapter_kwargs: dict[str, Any] = {
@@ -193,12 +230,17 @@ class APSWGSheetsDialect(APSWDialect):  # pylint: disable=too-many-instance-attr
         # pylint: disable=protected-access
         config = connection._adapter_kwargs["gsheetsapi"]
 
+        def pick(name: str) -> Any:
+            # arguments passed via ``connect_args`` override the dialect's own
+            value = config.get(name)
+            return getattr(self, name) if value in (None, False, {}) else value
+
         credentials = get_credentials(
-            config.get("access_token", self.access_token),
-            config.get("service_account_file", self.service_account_file),
-            self.service_account_info,
-            config.get("subject", self.subject),
-            config.get("app_default_credentials", self.app_default_credentials),
+            pick("access_token"),
+            pick("service_account_file"),
+            pick("service_account_info"),
+            pick("subject"),
+            pick("app_default_credentials"),
         )
         if not (credentials and self.list_all_sheets):
             return table_names
@@ -215,19 +257,28 @@ class APSWGSheetsDialect(APSWDialect):  # pylint: disable=too-many-instance-attr
 def get_spreadsheet_ids(session: AuthorizedSession) -> list[str]:
     """
     Return the ID of all spreadsheets that the user has access to.
-    """
-    url = (
-        "https://www.googleapis.com/drive/v3/files?"
-        "q=mimeType='application/vnd.google-apps.spreadsheet'"
-    )
-    _logger.info("GET %s", url)
-    response = session.get(url)
-    payload = response.json()
-    _logger.debug(payload)
-    if "error" in payload:
-        raise ProgrammingError(payload["error"]["message"])
 
-    return [file["id"] for file in payload["files"]]
+    Trashed files are skipped and every page of results is read.
+    """
+    url = "https://www.googleapis.com/drive/v3/files"
+    params: dict[str, Any] = {
+        "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+        "fields": "nextPageToken,files(id)",
+        "pageSize": 1000,
+    }
+    spreadsheet_ids: list[str] = []
+    while True:
+        _logger.info("GET %s", url)
+        response = session.get(url, params=dict(params))
+        payload = response.json()
+        _logger.debug(payload)
+        if "error" in payload:
+            raise ProgrammingError(payload["error"]["message"])
+
+        spreadsheet_ids.extend(file["id"] for file in payload.get("files", []))
+        if not payload.get("nextPageToken"):
+            return spreadsheet_ids
+        params["pageToken"] = payload["nextPageToken"]
 
 
 def get_sheet_urls(spreadsheet_id: str, session: AuthorizedSession) -> list[str]:
