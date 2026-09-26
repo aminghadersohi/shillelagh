@@ -5,7 +5,7 @@ Changelog
 Next
 ====
 
-- Stop logging adapter argument values, which can include credentials, at DEBUG level
+- Stop logging adapter argument values, which can include credentials, at DEBUG level (#553)
 
 Version 1.4.5 - 2026-07-30
 ==========================
