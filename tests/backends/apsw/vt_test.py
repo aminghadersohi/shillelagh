@@ -5,6 +5,7 @@ Tests for shillelagh.backends.apsw.vt.
 
 import datetime
 import json
+import logging
 from collections.abc import Iterable
 from typing import Any
 
@@ -25,6 +26,7 @@ from shillelagh.backends.apsw.vt import (
 from shillelagh.exceptions import ProgrammingError
 from shillelagh.fields import Field, Float, Integer, Order, String
 from shillelagh.filters import Equal, Operator
+from shillelagh.lib import serialize
 
 from ...fakes import FakeAdapter
 
@@ -78,6 +80,42 @@ def test_vt_module() -> None:
         create_table
         == """CREATE TABLE "table" ("age" REAL, "name" TEXT, "pets" INTEGER)"""
     )
+
+
+def test_vt_module_does_not_log_adapter_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Test that ``VTModule.Create`` never logs the adapter arguments.
+
+    Adapter arguments often carry credentials, so only the adapter name and the
+    number of arguments should be logged, even at the ``DEBUG`` level.
+    """
+
+    class FakeAdapterWithArgs(FakeAdapter):
+        """
+        A fake adapter that accepts arguments.
+        """
+
+        def __init__(self, *args: Any) -> None:  # pylint: disable=unused-argument
+            super().__init__()
+
+    secret = "not-a-real-secret-123"
+    args = [
+        f"'{serialize('https://example.com/')}'",
+        f"'{serialize({'access_token': secret})}'",
+    ]
+
+    caplog.set_level(logging.DEBUG, logger="shillelagh.backends.apsw.vt")
+    vt_module = VTModule(FakeAdapterWithArgs)
+    vt_module.Create(None, "", "", "table", *args)
+
+    assert "Instantiating adapter FakeAdapterWithArgs with 2 argument(s)" in (
+        caplog.messages
+    )
+    assert secret not in caplog.text
+    for record in caplog.records:
+        assert secret not in repr(record.args)
 
 
 def test_virtual_best_index() -> None:

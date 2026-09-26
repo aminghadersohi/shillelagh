@@ -258,9 +258,13 @@ class VTModule:  # pylint: disable=too-few-public-methods
         Called when a table is first created on a connection.
         """
         deserialized_args = [deserialize(arg[1:-1]) for arg in args]
+        # Adapter arguments often include credentials (tokens, keys, service
+        # account info), so never log their values; the adapter name and the
+        # number of arguments are enough for debugging.
         _logger.debug(
-            "Instantiating adapter with deserialized arguments: %s",
-            deserialized_args,
+            "Instantiating adapter %s with %d argument(s)",
+            self.adapter.__name__,
+            len(deserialized_args),
         )
         adapter = self.adapter(*deserialized_args)
         table = VTTable(adapter)
