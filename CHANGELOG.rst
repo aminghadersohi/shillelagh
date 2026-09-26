@@ -5,6 +5,10 @@ Changelog
 Next
 ====
 
+- Google Sheets ``UPDATE`` and ``BATCH`` uploads keep formulas, text and unlabeled columns they do not change (#554)
+- Use ``adapter_kwargs`` passed to ``create_engine`` for ``gsheets://``; read every Drive page and ``connect_args`` credentials in ``list_all_sheets`` (#554)
+- Add a default timeout to anonymous Google Sheets requests (#554)
+
 Version 1.4.5 - 2026-07-30
 ==========================
 
