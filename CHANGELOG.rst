@@ -5,6 +5,9 @@ Changelog
 Next
 ====
 
+- Quote Google Sheets string filters that contain quotes so they are never parsed as query syntax
+- Raise an error for Google Sheets URLs whose ``gid`` does not exist instead of reading the first sheet
+
 Version 1.4.5 - 2026-07-30
 ==========================
 

@@ -166,12 +166,14 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         self._spreadsheet_id = parts.path.split("/")[3]
 
         query_string = urllib.parse.parse_qs(parts.query)
+        explicit_gid = True
         if "gid" in query_string:
             sheet_id = int(query_string["gid"][-1])
         elif parts.fragment.startswith("gid="):
             sheet_id = int(parts.fragment[len("gid=") :])
         else:
             sheet_id = 0
+            explicit_gid = False
         self._sheet_id = sheet_id
 
         if not self.credentials:
@@ -197,6 +199,12 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
                 self._sheet_name = sheet["properties"]["title"]
                 break
         else:
+            # The Chart API silently falls back to the first sheet when the
+            # ``gid`` does not exist, which would return data from another sheet.
+            if explicit_gid:
+                raise ProgrammingError(
+                    f"Sheet with gid={sheet_id} was not found in the spreadsheet",
+                )
             _logger.warning("Could not determine sheet name!")
 
     def _get_session(self) -> Session:

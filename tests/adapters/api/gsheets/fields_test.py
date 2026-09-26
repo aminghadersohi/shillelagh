@@ -18,6 +18,7 @@ from shillelagh.adapters.api.gsheets.fields import (
     GSheetsTime,
     parse_gviz_date,
 )
+from shillelagh.exceptions import ProgrammingError
 from shillelagh.fields import ISODateTime, Order
 
 
@@ -270,3 +271,11 @@ def test_GSheetsString() -> None:
     assert GSheetsString().quote(None) == "null"
     assert GSheetsString().quote("") == "''"
     assert GSheetsString().quote("test") == "'test'"
+    assert GSheetsString().quote("O'Reilly") == '"O\'Reilly"'
+    assert GSheetsString().quote('say "hi"') == "'say \"hi\"'"
+    assert GSheetsString().quote("x' or B != 'y") == "\"x' or B != 'y\""
+    with pytest.raises(ProgrammingError) as excinfo:
+        GSheetsString().quote('it\'s "both"')
+    assert str(excinfo.value) == (
+        "Strings with both single and double quotes cannot be used in filters"
+    )

@@ -15,6 +15,7 @@ from shillelagh.adapters.api.gsheets.parsing.number import (
     format_number_pattern,
     parse_number_pattern,
 )
+from shillelagh.exceptions import ProgrammingError
 from shillelagh.fields import External, Field, Internal, Order, StringBoolean
 from shillelagh.filters import Filter
 
@@ -387,7 +388,21 @@ class GSheetsString(GSheetsField[str, str]):
         return "" if value is None else value
 
     def quote(self, value: Optional[str]) -> str:
+        """
+        Quote a string for the Chart API query language.
+
+        The language has no escape sequence, so values containing a single quote
+        are wrapped in double quotes instead. A value containing both cannot be
+        represented and is rejected, so that it is never interpreted as syntax.
+        """
         if value is None:
             return "null"
 
-        return f"'{value}'"
+        if "'" not in value:
+            return f"'{value}'"
+        if '"' not in value:
+            return f'"{value}"'
+
+        raise ProgrammingError(
+            "Strings with both single and double quotes cannot be used in filters",
+        )

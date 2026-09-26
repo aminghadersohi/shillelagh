@@ -1132,11 +1132,44 @@ def test_set_metadata(
     assert gsheets_adapter._sheet_id == 0
     assert gsheets_adapter._sheet_name == "Sheet1"
 
-    _logger = mocker.patch("shillelagh.adapters.api.gsheets.adapter._logger")
-    gsheets_adapter = GSheetsAPI(
-        "https://docs.google.com/spreadsheets/d/1/edit#gid=43",
-        "XXX",
+    # an explicit ``gid`` that does not exist must not fall back to another sheet
+    with pytest.raises(ProgrammingError) as excinfo:
+        GSheetsAPI(
+            "https://docs.google.com/spreadsheets/d/1/edit#gid=43",
+            "XXX",
+        )
+    assert str(excinfo.value) == "Sheet with gid=43 was not found in the spreadsheet"
+    with pytest.raises(ProgrammingError):
+        GSheetsAPI(
+            "https://docs.google.com/spreadsheets/d/1/edit?gid=43",
+            "XXX",
+        )
+
+
+def test_set_metadata_without_gid(mocker: MockerFixture) -> None:
+    """
+    Test that a URL without an explicit ``gid`` only warns when sheet 0 is missing.
+    """
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.GSheetsAPI._set_columns",
     )
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.get_credentials",
+        return_value="SECRET",
+    )
+    session = mocker.MagicMock()
+    session.get().json.return_value = {
+        "properties": {"timeZone": "America/Los_Angeles"},
+        "sheets": [{"properties": {"sheetId": 42, "title": "Other"}}],
+    }
+    mocker.patch(
+        "shillelagh.adapters.api.gsheets.adapter.GSheetsAPI._get_session",
+        return_value=session,
+    )
+    _logger = mocker.patch("shillelagh.adapters.api.gsheets.adapter._logger")
+
+    gsheets_adapter = GSheetsAPI("https://docs.google.com/spreadsheets/d/1/edit")
+    assert gsheets_adapter._sheet_id == 0
     assert gsheets_adapter._sheet_name is None
     _logger.warning.assert_called_with("Could not determine sheet name!")
 
