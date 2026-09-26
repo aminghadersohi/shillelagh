@@ -5,6 +5,8 @@ Changelog
 Next
 ====
 
+- Avoid logging raw adapter arguments, which may contain credentials (#552)
+
 Version 1.4.5 - 2026-07-30
 ==========================
 
